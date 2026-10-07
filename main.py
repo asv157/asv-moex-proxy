@@ -61,3 +61,42 @@ def get_stock_price(ticker: str):
         raise HTTPException(status_code=502, detail=f"Ошибка при запросе к Мосбирже: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
+        
+@app.get("/name/{ticker}")
+def get_stock_name(ticker: str):
+    """
+    Принимает тикер, идёт в API Мосбиржи и возвращает краткое название компании.
+    """
+    ticker = ticker.upper().strip()
+    
+    # URL для получения справочной информации по бумаге
+    url = f"https://iss.moex.com/iss/securities/{ticker}.json?iss.meta=off"
+    
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Парсим блок 'description', где лежит shortname
+        columns = data['description']['columns']
+        rows = data['description']['data']
+        
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"Нет данных для тикера {ticker}")
+        
+        # Ищем строку, где в поле 'name' записано 'shortname'
+        try:
+            name_idx = columns.index('name')
+            value_idx = columns.index('value')
+            for row in rows:
+                if row[name_idx] == 'shortname':
+                    return {"ticker": ticker, "name": row[value_idx]}
+        except (ValueError, IndexError):
+            pass
+            
+        raise HTTPException(status_code=404, detail=f"Название для {ticker} не найдено")
+        
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка при запросе к Мосбирже: {str(e)}")
