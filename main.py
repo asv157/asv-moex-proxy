@@ -83,7 +83,7 @@ def get_stock_name(ticker: str):
     value_idx = columns.index('value')
     
     for row in rows:
-        if row[name_idx] == 'shortname':
+        if row[name_idx] == 'SHORTNAME':
             return {"ticker": ticker, "name": row[value_idx]}
     
     # Если shortname не найден — вернём все поля для отладки
