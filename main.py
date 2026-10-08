@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -106,32 +106,37 @@ def get_stocks_prices(tickers: str):
     
     def fetch_price(ticker):
         try:
-            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
-            response = requests.get(url, headers=headers, timeout=5)
-            
-            if response.status_code != 200:
-                return ticker, None
-            
-            data = response.json()
-            columns = data['marketdata']['columns']
-            rows = data['marketdata']['data']
-            
-            if not rows:
-                return ticker, None
-            
-            try:
-                price_index = columns.index('LAST')
-                return ticker, rows[0][price_index]
-            except (ValueError, IndexError):
-                return ticker, None
+            # Используем Session для переиспользования соединения
+            with requests.Session() as session:
+                session.headers.update(headers)
+                url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
+                response = session.get(url, timeout=5)
                 
+                if response.status_code != 200:
+                    return ticker, None
+                
+                data = response.json()
+                columns = data['marketdata']['columns']
+                rows = data['marketdata']['data']
+                
+                if not rows:
+                    return ticker, None
+                
+                try:
+                    price_index = columns.index('LAST')
+                    return ticker, rows[0][price_index]
+                except (ValueError, IndexError):
+                    return ticker, None
+                    
         except Exception:
             return ticker, None
     
-    # Параллельные запросы: 10 потоков одновременно
     result = {}
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        for ticker, price in executor.map(fetch_price, ticker_list):
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_price, t): t for t in ticker_list}
+        
+        for future in as_completed(futures):
+            ticker, price = future.result()
             result[ticker] = price
     
     return result
