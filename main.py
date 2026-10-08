@@ -89,4 +89,49 @@ def get_stock_name(ticker: str):
     # Если shortname не найден — вернём все поля для отладки
     debug_fields = [row[name_idx] for row in rows]
     raise HTTPException(status_code=404, detail=f"shortname не найден. Доступные поля: {debug_fields}")
+@app.get("/stocks")
+def get_stocks_prices(tickers: str):
+    """
+    Принимает список тикеров через запятую: /stocks?tickers=SBER,GAZP,LKOH
+    Возвращает JSON вида: {"SBER": 279.53, "GAZP": 165.20, ...}
+    """
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Параметр tickers обязателен")
+    
+    ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
+    
+    if not ticker_list:
+        raise HTTPException(status_code=400, detail="Пустой список тикеров")
+    
+    result = {}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    for ticker in ticker_list:
+        try:
+            url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
+            response = requests.get(url, headers=headers, timeout=5)
+            
+            if response.status_code != 200:
+                result[ticker] = None
+                continue
+            
+            data = response.json()
+            columns = data['marketdata']['columns']
+            rows = data['marketdata']['data']
+            
+            if not rows:
+                result[ticker] = None
+                continue
+            
+            try:
+                price_index = columns.index('LAST')
+                price = rows[0][price_index]
+                result[ticker] = price
+            except (ValueError, IndexError):
+                result[ticker] = None
+                
+        except Exception:
+            result[ticker] = None
+    
+    return result
     
