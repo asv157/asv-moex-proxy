@@ -130,7 +130,7 @@ def get_stocks_prices(tickers: str):
     
     # Параллельные запросы: 10 потоков одновременно
     result = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=30) as executor:
         for ticker, price in executor.map(fetch_price, ticker_list):
             result[ticker] = price
     
