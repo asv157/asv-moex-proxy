@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
@@ -143,3 +143,37 @@ def get_stocks_prices(tickers: str):
     
     return result
     
+import os
+
+# Токен Т-Банка берём из переменной окружения Render
+TINKOFF_TOKEN = os.environ.get('TINKOFF_TOKEN')
+
+@app.post("/tinkoff/{endpoint:path}")
+async def tinkoff_proxy(endpoint: str, request: Request):
+    """
+    Прокси для API Т-Банка.
+    Принимает путь и JSON, добавляет токен и отправляет в Т-Банк.
+    """
+    if not TINKOFF_TOKEN:
+        raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен на сервере")
+
+    # Формируем полный URL к API Т-Банка
+    url = f"https://invest-public-api.tbank.ru/rest/{endpoint}"
+
+    headers = {
+        "Authorization": f"Bearer {TINKOFF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        # Получаем тело запроса от Google Apps Script
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        # Отключаем проверку SSL (verify=False) — прокси работает в доверенном окружении
+        resp = requests.post(url, headers=headers, json=body, timeout=30, verify=False)
+        return resp.json()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка запроса к Т-Банку: {str(e)}")
