@@ -2,8 +2,30 @@ from fastapi import FastAPI, HTTPException, Request
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
+import sqlite3
+from datetime import datetime, timedelta
 
 app = FastAPI()
+# ============================================================
+# БАЗА ДАННЫХ ДЛЯ СВЕЧЕЙ
+# ============================================================
+DB_FILE = "candles.db"
+
+def init_db():
+    """Создаёт таблицу, если её нет."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS candles (
+            ticker TEXT,
+            time TEXT,
+            close REAL,
+            PRIMARY KEY (ticker, time)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
 
 # Разрешаем запросы откуда угодно (чтобы Google Таблицы могли к нам обращаться)
 app.add_middleware(
@@ -91,6 +113,7 @@ def get_stock_name(ticker: str):
     debug_fields = [row[name_idx] for row in rows]
     raise HTTPException(status_code=404, detail=f"shortname не найден. Доступные поля: {debug_fields}")
 
+init_db()
 
 @app.get("/stocks")
 def get_stocks_prices(tickers: str):
@@ -177,3 +200,132 @@ async def tinkoff_proxy(endpoint: str, request: Request):
         return resp.json()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Ошибка запроса к Т-Банку: {str(e)}")
+
+# ============================================================
+# УНИВЕРСАЛЬНЫЙ ПАРСЕР ЦЕНЫ
+# ============================================================
+def parse_price(val):
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except:
+            return 0.0
+    if isinstance(val, dict):
+        units = float(val.get('units', 0))
+        nano = float(val.get('nano', 0))
+        return units + nano / 1e9
+    return 0.0
+
+# ============================================================
+# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ
+# ============================================================
+@app.post("/candles/update")
+async def update_candles(request: Request):
+    body = await request.json()
+    tickers = body.get("tickers", [])
+    
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Список тикеров пуст")
+    
+    if not TINKOFF_TOKEN:
+        raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен")
+    
+    headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
+    results = {}
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    for ticker in tickers:
+        try:
+            # FIGI
+            url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+            resp = requests.post(url, headers=headers, json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}, timeout=30, verify=False)
+            data = resp.json()
+            
+            figi = None
+            for inst in data.get("instruments", []):
+                if inst.get("ticker") == ticker and inst.get("classCode") == "TQBR":
+                    figi = inst.get("figi")
+                    break
+            
+            if not figi:
+                results[ticker] = {"status": "error", "message": "FIGI не найден"}
+                continue
+            
+            # Последняя дата в базе
+            cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = ?", (ticker,))
+            last_time = cursor.fetchone()[0]
+            
+            if last_time:
+                from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
+            else:
+                from_date = datetime(2026, 1, 1)
+            
+            to_date = datetime.now()
+            new_candles = 0
+            current_start = from_date
+            
+            while current_start <= to_date:
+                current_end = min(current_start + timedelta(days=7), to_date)
+                
+                candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+                payload = {
+                    "figi": figi,
+                    "from": current_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "interval": "CANDLE_INTERVAL_5_MIN"
+                }
+                
+                try:
+                    candle_resp = requests.post(candle_url, headers=headers, json=payload, timeout=30, verify=False)
+                    candle_data = candle_resp.json()
+                    candles = candle_data.get("candles", [])
+                    
+                    for c in candles:
+                        close_price = parse_price(c.get("close"))
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO candles (ticker, time, close) VALUES (?, ?, ?)",
+                            (ticker, c["time"], close_price)
+                        )
+                        new_candles += 1
+                except Exception as e:
+                    pass
+                
+                current_start = current_end + timedelta(seconds=1)
+            
+            conn.commit()
+            results[ticker] = {"status": "ok", "new_candles": new_candles}
+            
+        except Exception as e:
+            results[ticker] = {"status": "error", "message": str(e)}
+    
+    conn.close()
+    return {"updated": results}
+
+
+@app.get("/candles/{ticker}")
+def get_candles(ticker: str, days: int = 120):
+    ticker = ticker.upper().strip()
+    from_date = datetime.now() - timedelta(days=days)
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT time, close FROM candles WHERE ticker = ? AND time >= ? ORDER BY time",
+        (ticker, from_date.isoformat())
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Нет данных для {ticker}")
+    
+    return {
+        "ticker": ticker,
+        "count": len(rows),
+        "candles": [{"time": r[0], "close": r[1]} for r in rows]
+    }
