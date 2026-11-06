@@ -6,6 +6,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
 import os
+import time
 
 app = FastAPI()
 
@@ -17,10 +18,16 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 def get_db_connection():
     if not DATABASE_URL:
         raise Exception("DATABASE_URL не настроен")
-    return psycopg2.connect(DATABASE_URL)
+    # Повторные попытки подключения (если Neon «спит»)
+    for attempt in range(3):
+        try:
+            return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            time.sleep(2)
 
 def init_db():
-    """Создаёт таблицу, если её нет."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -35,13 +42,14 @@ def init_db():
     cursor.close()
     conn.close()
 
-# Инициализируем базу при старте
+# Инициализация при старте
 try:
     init_db()
+    print("База данных инициализирована")
 except Exception as e:
     print(f"Ошибка инициализации базы: {e}")
 
-# Разрешаем запросы откуда угодно
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -195,7 +203,7 @@ def parse_price(val):
     return 0.0
 
 # ============================================================
-# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL)
+# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL, по месяцам)
 # ============================================================
 @app.post("/candles/update")
 async def update_candles(request: Request):
@@ -209,11 +217,17 @@ async def update_candles(request: Request):
     
     headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
     results = {}
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    
+    # Подключение к базе (один раз на все тикеры)
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка подключения к базе: {e}")
     
     for ticker in tickers:
         try:
+            # 1. FIGI
             url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
             resp = requests.post(url, headers=headers, json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}, timeout=30, verify=False)
             data = resp.json()
@@ -228,6 +242,7 @@ async def update_candles(request: Request):
                 results[ticker] = {"status": "error", "message": "FIGI не найден"}
                 continue
             
+            # 2. Последняя дата в базе
             cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
             last_time = cursor.fetchone()[0]
             
@@ -237,11 +252,13 @@ async def update_candles(request: Request):
                 from_date = datetime(2026, 1, 1)
             
             to_date = datetime.now()
+            
+            # 3. Загружаем по МЕСЯЦАМ (чтобы не перегружать память)
             new_candles = 0
             current_start = from_date
             
             while current_start <= to_date:
-                current_end = min(current_start + timedelta(days=7), to_date)
+                current_end = min(current_start + timedelta(days=30), to_date)
                 
                 candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
                 payload = {
@@ -252,23 +269,27 @@ async def update_candles(request: Request):
                 }
                 
                 try:
-                    candle_resp = requests.post(candle_url, headers=headers, json=payload, timeout=30, verify=False)
+                    candle_resp = requests.post(candle_url, headers=headers, json=payload, timeout=60, verify=False)
                     candle_data = candle_resp.json()
                     candles = candle_data.get("candles", [])
                     
-                    for c in candles:
-                        close_price = parse_price(c.get("close"))
-                        cursor.execute(
+                    # Массовая вставка (executemany) — быстрее и меньше памяти
+                    values = [(ticker, c["time"], parse_price(c.get("close"))) for c in candles]
+                    if values:
+                        cursor.executemany(
                             "INSERT INTO candles (ticker, time, close) VALUES (%s, %s, %s) ON CONFLICT (ticker, time) DO NOTHING",
-                            (ticker, c["time"], close_price)
+                            values
                         )
-                        new_candles += 1
+                        new_candles += len(values)
+                    
+                    conn.commit()
                 except Exception as e:
+                    conn.rollback()
+                    # Продолжаем со следующим месяцем
                     pass
                 
                 current_start = current_end + timedelta(seconds=1)
             
-            conn.commit()
             results[ticker] = {"status": "ok", "new_candles": new_candles}
             
         except Exception as e:
