@@ -2,18 +2,26 @@ from fastapi import FastAPI, HTTPException, Request
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
+import os
 
 app = FastAPI()
+
 # ============================================================
-# БАЗА ДАННЫХ ДЛЯ СВЕЧЕЙ
+# БАЗА ДАННЫХ (PostgreSQL на Neon)
 # ============================================================
-DB_FILE = "candles.db"
+DATABASE_URL = os.environ.get('DATABASE_URL')
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL не настроен")
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     """Создаёт таблицу, если её нет."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS candles (
@@ -24,10 +32,16 @@ def init_db():
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
+# Инициализируем базу при старте
+try:
+    init_db()
+except Exception as e:
+    print(f"Ошибка инициализации базы: {e}")
 
-# Разрешаем запросы откуда угодно (чтобы Google Таблицы могли к нам обращаться)
+# Разрешаем запросы откуда угодно
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,48 +49,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# СТАРЫЕ ЭНДПОИНТЫ (Мосбиржа)
+# ============================================================
 @app.get("/")
 def read_root():
     return {"message": "MOEX Proxy is running"}
 
 @app.get("/stock/{ticker}")
 def get_stock_price(ticker: str):
-    """
-    Принимает тикер, идёт в API Мосбиржи и возвращает цену.
-    """
     ticker = ticker.upper().strip()
-    
-    # URL для получения последней цены с основной торговой площадки (TQBR)
-    # Мы используем параметр iss.only, чтобы получить только нужный блок marketdata
     url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
     
     try:
-        # Делаем запрос от имени нашего сервера (с российским IP, если хостинг в РФ, или просто не Google)
-        # Добавляем User-Agent, чтобы Мосбиржа не думала, что мы бот
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        
         data = response.json()
         
-        # Парсим сложную структуру JSON от Мосбиржи
         columns = data['marketdata']['columns']
         rows = data['marketdata']['data']
         
         if not rows:
             raise HTTPException(status_code=404, detail=f"Нет данных для тикера {ticker}")
         
-        # Находим индекс колонки с ценой (LAST) и другими полями
         try:
             price_index = columns.index('LAST')
-            # Цена может быть None, если торги не идут
             price = rows[0][price_index]
         except (ValueError, IndexError):
             price = None
             
         if price is None:
-            # Если LAST пустой, пробуем взять цену закрытия или другую
-            raise HTTPException(status_code=404, detail=f"Цена для {ticker} недоступна (торги не идут или неверный тикер)")
+            raise HTTPException(status_code=404, detail=f"Цена для {ticker} недоступна")
             
         return {"ticker": ticker, "price": price}
         
@@ -84,7 +88,7 @@ def get_stock_price(ticker: str):
         raise HTTPException(status_code=502, detail=f"Ошибка при запросе к Мосбирже: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Внутренняя ошибка: {str(e)}")
-        
+
 @app.get("/name/{ticker}")
 def get_stock_name(ticker: str):
     ticker = ticker.upper().strip()
@@ -93,7 +97,6 @@ def get_stock_name(ticker: str):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     response = requests.get(url, headers=headers, timeout=10)
     response.raise_for_status()
-    
     data = response.json()
     
     if 'description' not in data:
@@ -101,7 +104,6 @@ def get_stock_name(ticker: str):
     
     columns = data['description']['columns']
     rows = data['description']['data']
-    
     name_idx = columns.index('name')
     value_idx = columns.index('value')
     
@@ -109,11 +111,7 @@ def get_stock_name(ticker: str):
         if row[name_idx] == 'SHORTNAME':
             return {"ticker": ticker, "name": row[value_idx]}
     
-    # Если shortname не найден — вернём все поля для отладки
-    debug_fields = [row[name_idx] for row in rows]
-    raise HTTPException(status_code=404, detail=f"shortname не найден. Доступные поля: {debug_fields}")
-
-init_db()
+    raise HTTPException(status_code=404, detail="shortname не найден")
 
 @app.get("/stocks")
 def get_stocks_prices(tickers: str):
@@ -121,7 +119,6 @@ def get_stocks_prices(tickers: str):
         raise HTTPException(status_code=400, detail="Параметр tickers обязателен")
     
     ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
-    
     if not ticker_list:
         raise HTTPException(status_code=400, detail="Пустой список тикеров")
     
@@ -129,73 +126,50 @@ def get_stocks_prices(tickers: str):
     
     def fetch_price(ticker):
         try:
-            # Используем Session для переиспользования соединения
             with requests.Session() as session:
                 session.headers.update(headers)
                 url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
                 response = session.get(url, timeout=5)
-                
                 if response.status_code != 200:
                     return ticker, None
-                
                 data = response.json()
                 columns = data['marketdata']['columns']
                 rows = data['marketdata']['data']
-                
                 if not rows:
                     return ticker, None
-                
                 try:
                     price_index = columns.index('LAST')
                     return ticker, rows[0][price_index]
                 except (ValueError, IndexError):
                     return ticker, None
-                    
         except Exception:
             return ticker, None
     
     result = {}
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(fetch_price, t): t for t in ticker_list}
-        
         for future in as_completed(futures):
             ticker, price = future.result()
             result[ticker] = price
     
     return result
-    
-    return result
-    
-import os
 
-# Токен Т-Банка берём из переменной окружения Render
+# ============================================================
+# ПРОКСИ Т-БАНКА
+# ============================================================
 TINKOFF_TOKEN = os.environ.get('TINKOFF_TOKEN')
 
 @app.post("/tinkoff/{endpoint:path}")
 async def tinkoff_proxy(endpoint: str, request: Request):
-    """
-    Прокси для API Т-Банка.
-    Принимает путь и JSON, добавляет токен и отправляет в Т-Банк.
-    """
     if not TINKOFF_TOKEN:
-        raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен на сервере")
-
-    # Формируем полный URL к API Т-Банка
+        raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен")
     url = f"https://invest-public-api.tbank.ru/rest/{endpoint}"
-
-    headers = {
-        "Authorization": f"Bearer {TINKOFF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Получаем тело запроса от Google Apps Script
         body = await request.json()
     except Exception:
         body = {}
-
     try:
-        # Отключаем проверку SSL (verify=False) — прокси работает в доверенном окружении
         resp = requests.post(url, headers=headers, json=body, timeout=30, verify=False)
         return resp.json()
     except requests.RequestException as e:
@@ -221,7 +195,7 @@ def parse_price(val):
     return 0.0
 
 # ============================================================
-# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ
+# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL)
 # ============================================================
 @app.post("/candles/update")
 async def update_candles(request: Request):
@@ -230,18 +204,16 @@ async def update_candles(request: Request):
     
     if not tickers:
         raise HTTPException(status_code=400, detail="Список тикеров пуст")
-    
     if not TINKOFF_TOKEN:
         raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен")
     
     headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
     results = {}
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     for ticker in tickers:
         try:
-            # FIGI
             url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
             resp = requests.post(url, headers=headers, json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}, timeout=30, verify=False)
             data = resp.json()
@@ -256,8 +228,7 @@ async def update_candles(request: Request):
                 results[ticker] = {"status": "error", "message": "FIGI не найден"}
                 continue
             
-            # Последняя дата в базе
-            cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = ?", (ticker,))
+            cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
             last_time = cursor.fetchone()[0]
             
             if last_time:
@@ -288,7 +259,7 @@ async def update_candles(request: Request):
                     for c in candles:
                         close_price = parse_price(c.get("close"))
                         cursor.execute(
-                            "INSERT OR IGNORE INTO candles (ticker, time, close) VALUES (?, ?, ?)",
+                            "INSERT INTO candles (ticker, time, close) VALUES (%s, %s, %s) ON CONFLICT (ticker, time) DO NOTHING",
                             (ticker, c["time"], close_price)
                         )
                         new_candles += 1
@@ -301,24 +272,29 @@ async def update_candles(request: Request):
             results[ticker] = {"status": "ok", "new_candles": new_candles}
             
         except Exception as e:
+            conn.rollback()
             results[ticker] = {"status": "error", "message": str(e)}
     
+    cursor.close()
     conn.close()
     return {"updated": results}
 
-
+# ============================================================
+# ЧТЕНИЕ СВЕЧЕЙ ИЗ БАЗЫ (PostgreSQL)
+# ============================================================
 @app.get("/candles/{ticker}")
 def get_candles(ticker: str, days: int = 120):
     ticker = ticker.upper().strip()
     from_date = datetime.now() - timedelta(days=days)
     
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
-        "SELECT time, close FROM candles WHERE ticker = ? AND time >= ? ORDER BY time",
+        "SELECT time, close FROM candles WHERE ticker = %s AND time >= %s ORDER BY time",
         (ticker, from_date.isoformat())
     )
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     
     if not rows:
@@ -327,5 +303,5 @@ def get_candles(ticker: str, days: int = 120):
     return {
         "ticker": ticker,
         "count": len(rows),
-        "candles": [{"time": r[0], "close": r[1]} for r in rows]
+        "candles": [{"time": r["time"], "close": r["close"]} for r in rows]
     }
