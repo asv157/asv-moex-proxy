@@ -243,8 +243,17 @@ async def update_candles(request: Request):
                 continue
             
             # 2. Последняя дата в базе
-# Для принудительной загрузки — всегда с 2026-01-01 (или с даты, когда у SIBN есть данные)
-from_date = datetime(2026, 7, 1)  # <--- для SIBN данные начинаются с июля 2026
+            try:
+                cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
+                last_time = cursor.fetchone()[0]
+                
+                if last_time:
+                    from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
+                else:
+                    from_date = datetime(2026, 1, 1)
+            except Exception as e:
+                results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
+                continue
             
             to_date = datetime.now()
             
@@ -281,7 +290,7 @@ from_date = datetime(2026, 7, 1)  # <--- для SIBN данные начинаю
                     conn.commit()
                 except Exception as e:
                     conn.rollback()
-                    print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")  # <--- ВОТ ЭТО
+                    print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")
                 
                 current_start = current_end + timedelta(seconds=1)
             
