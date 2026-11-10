@@ -4,9 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 app = FastAPI()
 
@@ -243,16 +243,16 @@ async def update_candles(request: Request):
             try:
                 cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
                 last_time = cursor.fetchone()[0]
-                
                 if last_time:
                     from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
                 else:
-                    from_date = datetime(2026, 1, 1)
+                    from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)  # <--- ДОБАВЛЕНО tzinfo                
+
             except Exception as e:
                 results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
                 continue
             
-            to_date = datetime.now()
+            to_date = datetime.now(timezone.utc)
             new_candles = 0
             current_start = from_date
             
