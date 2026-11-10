@@ -250,7 +250,7 @@ async def update_candles(request: Request):
                 if last_time:
                     from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
                 else:
-                    from_date = datetime(2026, 1, 1)
+                    from_date = datetime(2026, 7, 1)
             except Exception as e:
                 results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
                 continue
