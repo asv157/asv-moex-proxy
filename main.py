@@ -18,7 +18,6 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 def get_db_connection():
     if not DATABASE_URL:
         raise Exception("DATABASE_URL не настроен")
-    # Повторные попытки подключения (если Neon «спит»)
     for attempt in range(3):
         try:
             return psycopg2.connect(DATABASE_URL, connect_timeout=10)
@@ -42,7 +41,6 @@ def init_db():
     cursor.close()
     conn.close()
 
-# Инициализация при старте
 try:
     init_db()
     print("База данных инициализирована")
@@ -218,7 +216,6 @@ async def update_candles(request: Request):
     headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
     results = {}
     
-    # Подключение к базе (один раз на все тикеры)
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -250,14 +247,12 @@ async def update_candles(request: Request):
                 if last_time:
                     from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
                 else:
-                    from_date = datetime(2026, 7, 1)
+                    from_date = datetime(2026, 1, 1)
             except Exception as e:
                 results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
                 continue
             
             to_date = datetime.now()
-            
-            # 3. Загружаем по МЕСЯЦАМ (чтобы не перегружать память)
             new_candles = 0
             current_start = from_date
             
@@ -291,10 +286,15 @@ async def update_candles(request: Request):
                 except Exception as e:
                     conn.rollback()
                     print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")
+                    # ВАЖНО: возвращаем ошибку в ответ, чтобы её было видно
+                    results[ticker] = {"status": "error", "message": f"Ошибка записи на {current_start.date()}: {str(e)}"}
+                    break
                 
                 current_start = current_end + timedelta(seconds=1)
             
-            results[ticker] = {"status": "ok", "new_candles": new_candles}
+            # Если ошибки не было — записываем успех
+            if ticker not in results:
+                results[ticker] = {"status": "ok", "new_candles": new_candles}
             
         except Exception as e:
             conn.rollback()
