@@ -310,13 +310,16 @@ async def update_candles(request: Request):
 @app.get("/candles/{ticker}")
 def get_candles(ticker: str, days: int = 120):
     ticker = ticker.upper().strip()
-    from_date = datetime.now() - timedelta(days=days)
+    
+    # Используем UTC-время, чтобы совпадало с тем, что в базе
+    from datetime import timezone
+    from_date = datetime.now(timezone.utc) - timedelta(days=days)
     
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
         "SELECT time, close FROM candles WHERE ticker = %s AND time >= %s ORDER BY time",
-        (ticker, from_date.isoformat())
+        (ticker, from_date.isoformat().replace('+00:00', 'Z'))
     )
     rows = cursor.fetchall()
     cursor.close()
