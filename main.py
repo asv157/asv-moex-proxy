@@ -257,7 +257,7 @@ async def update_candles(request: Request):
             current_start = from_date
             
             while current_start <= to_date:
-                current_end = min(current_start + timedelta(days=7), to_date)
+                current_end = min(current_start + timedelta(days=1), to_date)
                 
                 candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
                 payload = {
@@ -265,6 +265,7 @@ async def update_candles(request: Request):
                     "from": current_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "to": current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "interval": "CANDLE_INTERVAL_5_MIN"
+                    "limit": 200
                 }
                 
                 try:
