@@ -273,7 +273,8 @@ async def update_candles(request: Request):
                     candle_data = candle_resp.json()
                     candles = candle_data.get("candles", [])
                     
-                    # Массовая вставка (executemany) — быстрее и меньше памяти
+                    print(f"[{ticker}] {current_start.date()} — {current_end.date()}: получено {len(candles)} свечей")
+                    
                     values = [(ticker, c["time"], parse_price(c.get("close"))) for c in candles]
                     if values:
                         cursor.executemany(
@@ -285,8 +286,7 @@ async def update_candles(request: Request):
                     conn.commit()
                 except Exception as e:
                     conn.rollback()
-                    # Продолжаем со следующим месяцем
-                    pass
+                    print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")  # <--- ВОТ ЭТО
                 
                 current_start = current_end + timedelta(seconds=1)
             
