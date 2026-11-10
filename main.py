@@ -264,7 +264,7 @@ async def update_candles(request: Request):
                     "figi": figi,
                     "from": current_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "to": current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "interval": "CANDLE_INTERVAL_5_MIN"
+                    "interval": "CANDLE_INTERVAL_5_MIN",
                     "limit": 200
                 }
                 
