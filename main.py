@@ -207,6 +207,7 @@ def parse_price(val):
 async def update_candles(request: Request):
     body = await request.json()
     tickers = body.get("tickers", [])
+    days_back = body.get("days_back", 30) # по умолчанию 30 дней
     
     if not tickers:
         raise HTTPException(status_code=400, detail="Список тикеров пуст")
@@ -246,7 +247,8 @@ async def update_candles(request: Request):
                 if last_time:
                     from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
                 else:
-                    from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)  # <--- ДОБАВЛЕНО tzinfo                
+                    # Если данных нет, грузим с начала года, но не глубже days_back
+                    from_date = datetime.now(timezone.utc) - timedelta(days=days_back)               
 
             except Exception as e:
                 results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
