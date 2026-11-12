@@ -201,13 +201,13 @@ def parse_price(val):
     return 0.0
 
 # ============================================================
-# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL, по месяцам)
+# ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL)
 # ============================================================
 @app.post("/candles/update")
 async def update_candles(request: Request):
     body = await request.json()
     tickers = body.get("tickers", [])
-    days_back = body.get("days_back", 30) # по умолчанию 30 дней
+    days_back = body.get("days_back")
     
     if not tickers:
         raise HTTPException(status_code=400, detail="Список тикеров пуст")
@@ -225,7 +225,7 @@ async def update_candles(request: Request):
     
     for ticker in tickers:
         try:
-            # 1. FIGI
+            # 1. Получаем FIGI
             url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
             resp = requests.post(url, headers=headers, json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}, timeout=30, verify=False)
             data = resp.json()
@@ -240,26 +240,27 @@ async def update_candles(request: Request):
                 results[ticker] = {"status": "error", "message": "FIGI не найден"}
                 continue
             
-            # 2. Последняя дата в базе
-            try:
+            # 2. Определяем период
+            if days_back:
+                # Если передан days_back, грузим ровно этот кусок (например, 7 дней)
+                to_date = datetime.now(timezone.utc)
+                from_date = to_date - timedelta(days=days_back)
+            else:
+                # Если days_back не передан, смотрим на последнюю дату в базе
                 cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
                 last_time = cursor.fetchone()[0]
                 if last_time:
                     from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
                 else:
-                    # Если данных нет, грузим с начала года, но не глубже days_back
-                    from_date = datetime.now(timezone.utc) - timedelta(days=days_back)               
-
-            except Exception as e:
-                results[ticker] = {"status": "error", "message": f"Ошибка получения даты: {str(e)}"}
-                continue
+                    from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                to_date = datetime.now(timezone.utc)
             
-            to_date = datetime.now(timezone.utc)
             new_candles = 0
             current_start = from_date
             
+            # Грузим по 7 дней за раз (даже если period меньше, цикл сделает 1 итерацию)
             while current_start <= to_date:
-                current_end = min(current_start + timedelta(days=1), to_date)
+                current_end = min(current_start + timedelta(days=7), to_date)
                 
                 candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
                 payload = {
@@ -289,13 +290,11 @@ async def update_candles(request: Request):
                 except Exception as e:
                     conn.rollback()
                     print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")
-                    # ВАЖНО: возвращаем ошибку в ответ, чтобы её было видно
-                    results[ticker] = {"status": "error", "message": f"Ошибка записи на {current_start.date()}: {str(e)}"}
+                    results[ticker] = {"status": "error", "message": f"Ошибка записи: {str(e)}"}
                     break
                 
                 current_start = current_end + timedelta(seconds=1)
             
-            # Если ошибки не было — записываем успех
             if ticker not in results:
                 results[ticker] = {"status": "ok", "new_candles": new_candles}
             
