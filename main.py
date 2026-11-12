@@ -260,7 +260,7 @@ async def update_candles(request: Request):
             
             # Грузим по 7 дней за раз (даже если period меньше, цикл сделает 1 итерацию)
             while current_start <= to_date:
-                current_end = min(current_start + timedelta(days=7), to_date)
+                current_end = min(current_start + timedelta(days=1), to_date)
                 
                 candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
                 payload = {
