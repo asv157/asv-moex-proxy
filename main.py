@@ -268,7 +268,7 @@ async def update_candles(request: Request):
                     "from": current_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "to": current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "interval": "CANDLE_INTERVAL_5_MIN",
-                    "limit": 200
+                    "limit": 1000
                 }
                 
                 try:
