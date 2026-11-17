@@ -3,24 +3,37 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi.middleware.cors import CORSMiddleware
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from fastapi.responses import JSONResponse
+from typing import Optional
+
+load_dotenv()
+
+DATABASE_URL = os.environ.get('DATABASE_URL')
+TINKOFF_TOKEN = os.environ.get('TINKOFF_TOKEN')
 
 app = FastAPI()
 
 # ============================================================
 # БАЗА ДАННЫХ (PostgreSQL на Neon)
 # ============================================================
-DATABASE_URL = os.environ.get('DATABASE_URL')
-
 def get_db_connection():
     if not DATABASE_URL:
         raise Exception("DATABASE_URL не настроен")
     for attempt in range(3):
         try:
-            return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            return psycopg2.connect(
+                DATABASE_URL,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5
+            )
         except Exception as e:
             if attempt == 2:
                 raise e
@@ -66,30 +79,30 @@ def read_root():
 def get_stock_price(ticker: str):
     ticker = ticker.upper().strip()
     url = f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}.json?iss.meta=off&iss.only=marketdata"
-    
+
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
+
         columns = data['marketdata']['columns']
         rows = data['marketdata']['data']
-        
+
         if not rows:
             raise HTTPException(status_code=404, detail=f"Нет данных для тикера {ticker}")
-        
+
         try:
             price_index = columns.index('LAST')
             price = rows[0][price_index]
         except (ValueError, IndexError):
             price = None
-            
+
         if price is None:
             raise HTTPException(status_code=404, detail=f"Цена для {ticker} недоступна")
-            
+
         return {"ticker": ticker, "price": price}
-        
+
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Ошибка при запросе к Мосбирже: {str(e)}")
     except Exception as e:
@@ -99,37 +112,37 @@ def get_stock_price(ticker: str):
 def get_stock_name(ticker: str):
     ticker = ticker.upper().strip()
     url = f"https://iss.moex.com/iss/securities/{ticker}.json?iss.meta=off"
-    
+
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     response = requests.get(url, headers=headers, timeout=10)
     response.raise_for_status()
     data = response.json()
-    
+
     if 'description' not in data:
         raise HTTPException(status_code=404, detail="Нет блока description")
-    
+
     columns = data['description']['columns']
     rows = data['description']['data']
     name_idx = columns.index('name')
     value_idx = columns.index('value')
-    
+
     for row in rows:
         if row[name_idx] == 'SHORTNAME':
             return {"ticker": ticker, "name": row[value_idx]}
-    
+
     raise HTTPException(status_code=404, detail="shortname не найден")
 
 @app.get("/stocks")
 def get_stocks_prices(tickers: str):
     if not tickers:
         raise HTTPException(status_code=400, detail="Параметр tickers обязателен")
-    
+
     ticker_list = [t.strip().upper() for t in tickers.split(',') if t.strip()]
     if not ticker_list:
         raise HTTPException(status_code=400, detail="Пустой список тикеров")
-    
+
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
+
     def fetch_price(ticker):
         try:
             with requests.Session() as session:
@@ -150,21 +163,19 @@ def get_stocks_prices(tickers: str):
                     return ticker, None
         except Exception:
             return ticker, None
-    
+
     result = {}
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(fetch_price, t): t for t in ticker_list}
         for future in as_completed(futures):
             ticker, price = future.result()
             result[ticker] = price
-    
+
     return result
 
 # ============================================================
 # ПРОКСИ Т-БАНКА
 # ============================================================
-TINKOFF_TOKEN = os.environ.get('TINKOFF_TOKEN')
-
 @app.post("/tinkoff/{endpoint:path}")
 async def tinkoff_proxy(endpoint: str, request: Request):
     if not TINKOFF_TOKEN:
@@ -201,6 +212,54 @@ def parse_price(val):
     return 0.0
 
 # ============================================================
+# КЭШ FIGI
+# ============================================================
+_FIGI_CACHE: dict = {}
+
+def resolve_figi(ticker: str, headers: dict) -> Optional[str]:
+    """Резолвит FIGI для тикера с кэшем в памяти (classCode == TQBR)."""
+    if ticker in _FIGI_CACHE:
+        return _FIGI_CACHE[ticker]
+    url = ("https://invest-public-api.tbank.ru/rest/"
+           "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument")
+    resp = requests.post(
+        url, headers=headers,
+        json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"},
+        timeout=30, verify=False
+    )
+    for inst in resp.json().get("instruments", []):
+        if inst.get("ticker") == ticker and inst.get("classCode") == "TQBR":
+            _FIGI_CACHE[ticker] = inst["figi"]
+            return inst["figi"]
+    return None
+
+CANDLE_URL = ("https://invest-public-api.tbank.ru/rest/"
+              "tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles")
+
+# ============================================================
+# БЕЗОПАСНАЯ ЗАПИСЬ (переподключение при InterfaceError)
+# ============================================================
+def safe_execute(cursor, conn, values):
+    """Пишет values в candles. При обрыве соединения — переподключается и повторяет."""
+    query = ("INSERT INTO candles (ticker, time, close) VALUES %s "
+             "ON CONFLICT (ticker, time) DO NOTHING")
+    try:
+        execute_values(cursor, query, values)
+        conn.commit()
+        return conn, cursor
+    except psycopg2.InterfaceError:
+        print("!!! Соединение с базой умерло, переподключаемся...")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        execute_values(cursor, query, values)
+        conn.commit()
+        return conn, cursor
+
+# ============================================================
 # ОБНОВЛЕНИЕ БАЗЫ СВЕЧЕЙ (PostgreSQL)
 # ============================================================
 @app.post("/candles/update")
@@ -208,115 +267,92 @@ async def update_candles(request: Request):
     body = await request.json()
     tickers = body.get("tickers", [])
     days_back = body.get("days_back")
-    
+
     if not tickers:
         raise HTTPException(status_code=400, detail="Список тикеров пуст")
     if not TINKOFF_TOKEN:
         raise HTTPException(status_code=500, detail="TINKOFF_TOKEN не настроен")
-    
+
     headers = {"Authorization": f"Bearer {TINKOFF_TOKEN}", "Content-Type": "application/json"}
     results = {}
-    
+
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка подключения к базе: {e}")
-    
+
     for ticker in tickers:
         try:
-            # 1. Получаем FIGI
-            url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
-            resp = requests.post(url, headers=headers, json={"query": ticker, "instrumentKind": "INSTRUMENT_TYPE_SHARE"}, timeout=30, verify=False)
-            data = resp.json()
-            
-            figi = None
-            for inst in data.get("instruments", []):
-                if inst.get("ticker") == ticker and inst.get("classCode") == "TQBR":
-                    figi = inst.get("figi")
-                    break
-            
+            figi = resolve_figi(ticker, headers)
             if not figi:
                 results[ticker] = {"status": "error", "message": "FIGI не найден"}
                 continue
-            
-            # 2. Определяем период
+
             if days_back:
-                # Если передан days_back, грузим ровно этот кусок (например, 7 дней)
                 to_date = datetime.now(timezone.utc)
                 from_date = to_date - timedelta(days=days_back)
             else:
-                # Если days_back не передан, смотрим на последнюю дату в базе
                 cursor.execute("SELECT MAX(time) FROM candles WHERE ticker = %s", (ticker,))
                 last_time = cursor.fetchone()[0]
                 if last_time:
-                    from_date = datetime.fromisoformat(last_time.replace('Z', '+00:00')) + timedelta(minutes=1)
+                    from_date = (datetime.fromisoformat(last_time.replace('Z', '+00:00'))
+                                 + timedelta(minutes=5))
                 else:
-                    from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+                    from_date = datetime.now(timezone.utc) - timedelta(days=365)
                 to_date = datetime.now(timezone.utc)
-            
+
             new_candles = 0
-            current_start = from_date
-            
-            # Грузим по 7 дней за раз (даже если period меньше, цикл сделает 1 итерацию)
-            while current_start <= to_date:
-                current_end = min(current_start + timedelta(days=1), to_date)
-                
-                candle_url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+            cur = from_date
+
+            while cur < to_date:
+                nxt = min(cur + timedelta(days=7), to_date)
                 payload = {
                     "figi": figi,
-                    "from": current_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "to": current_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "from": cur.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": nxt.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "interval": "CANDLE_INTERVAL_5_MIN",
-                    "limit": 1000
+                    "limit": 1000,
                 }
-                
                 try:
-                    candle_resp = requests.post(candle_url, headers=headers, json=payload, timeout=60, verify=False)
-                    candle_data = candle_resp.json()
-                    candles = candle_data.get("candles", [])
-                    
-                    print(f"[{ticker}] {current_start.date()} — {current_end.date()}: получено {len(candles)} свечей")
-                    
-                    values = [(ticker, c["time"], parse_price(c.get("close"))) for c in candles]
-                    if values:
-                        cursor.executemany(
-                            "INSERT INTO candles (ticker, time, close) VALUES (%s, %s, %s) ON CONFLICT (ticker, time) DO NOTHING",
-                            values
-                        )
+                    candle_resp = requests.post(
+                        CANDLE_URL, headers=headers, json=payload,
+                        timeout=60, verify=False
+                    )
+                    candles = candle_resp.json().get("candles", [])
+                    print(f"[{ticker}] {cur.date()} — {nxt.date()}: получено {len(candles)} свечей")
+
+                    if candles:
+                        values = [(ticker, c["time"], parse_price(c.get("close"))) for c in candles]
+                        conn, cursor = safe_execute(cursor, conn, values)
                         new_candles += len(values)
-                    
-                    conn.commit()
                 except Exception as e:
-                    conn.rollback()
-                    print(f"[{ticker}] ОШИБКА на {current_start.date()}: {e}")
+                    print(f"[{ticker}] ОШИБКА на {cur.date()}: {e}")
                     results[ticker] = {"status": "error", "message": f"Ошибка записи: {str(e)}"}
                     break
-                
-                current_start = current_end + timedelta(seconds=1)
-            
+                cur = nxt
+
             if ticker not in results:
                 results[ticker] = {"status": "ok", "new_candles": new_candles}
-            
+
         except Exception as e:
-            conn.rollback()
             results[ticker] = {"status": "error", "message": str(e)}
-    
-    cursor.close()
-    conn.close()
+
+    try:
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass
     return {"updated": results}
 
 # ============================================================
 # ЧТЕНИЕ СВЕЧЕЙ ИЗ БАЗЫ (PostgreSQL)
 # ============================================================
 @app.get("/candles/{ticker}")
-def get_candles(ticker: str, days: int = 120):
+def get_candles(ticker: str, days: int = 120, interval: str = "5m"):
     ticker = ticker.upper().strip()
-    
-    # Используем UTC-время, чтобы совпадало с тем, что в базе
-    from datetime import timezone
     from_date = datetime.now(timezone.utc) - timedelta(days=days)
-    
+
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(
@@ -326,12 +362,24 @@ def get_candles(ticker: str, days: int = 120):
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-    
+
     if not rows:
         raise HTTPException(status_code=404, detail=f"Нет данных для {ticker}")
-    
+
+    if interval == "1h":
+        # Ресемплинг 5-минуток в часы: берём последнюю close в каждом часе
+        hourly = {}
+        for r in rows:
+            # time в формате "2026-11-13T10:05:00Z" — берём часть до минут
+            hour_key = r["time"][:13] + ":00:00Z"   # "2026-11-13T10:00:00Z"
+            hourly[hour_key] = r["close"]           # последняя в часе перезапишет
+        candles = [{"time": k, "close": v} for k, v in sorted(hourly.items())]
+    else:
+        candles = [{"time": r["time"], "close": r["close"]} for r in rows]
+
     return {
         "ticker": ticker,
-        "count": len(rows),
-        "candles": [{"time": r["time"], "close": r["close"]} for r in rows]
+        "interval": interval,
+        "count": len(candles),
+        "candles": candles
     }
